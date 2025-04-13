@@ -7,6 +7,7 @@ import numpy as np
 import re
 from mistralai import Mistral
 from langchain.prompts import PromptTemplate
+import concurrent.futures
 
 
 app = Flask(__name__)
@@ -70,15 +71,16 @@ def analyze():
     file = request.files['file']
     if file.filename == '':
         return jsonify({"error": "No selected file"}), 400
-    tmp_folder = os.path.join(os.getcwd(), "tmp")  # Use "tmp" in project directory
-    os.makedirs(tmp_folder, exist_ok=True)  # Create if it doesn't exist
 
+    tmp_folder = os.path.join(os.getcwd(), "tmp")
+    os.makedirs(tmp_folder, exist_ok=True)
     filename = secure_filename(file.filename)
-    file_path = os.path.join(tmp_folder, filename)  # Correct path for saving the file
-    
-    file.save(file_path) 
+    file_path = os.path.join(tmp_folder, filename)
+    file.save(file_path)
+
     transcript = transcribe_audio(file_path)
     metrics = analyze_audio(file_path, transcript)
+
     summary_prompt = PromptTemplate(
         input_variables=["transcript", "metrics"],
         template=(
@@ -88,39 +90,46 @@ def analyze():
             "1. **Overall Confidence Analysis**:\n"
             "- Provide an overall score out of 100, with a positive, friendly summary of the speaker's performance. Include encouragement and reassurance.\n\n"
             "2. **Detailed Metrics Evaluation**:\n"
-            "Under each metric, provide a score out of 10, a short friendly analysis, and constructive tips for improvement. Metrics to evaluate include:\n"
             "- **Volume**\n"
-            "- **Rate of Speech (WPM)**(normal is betwen(120-150) \n"
+            "- **Rate of Speech (WPM)** (normal is between 120–150)\n"
             "- **Pauses**\n"
             "- **Clarity**\n"
             "- **Pitch**\n"
             "- **Intonation**\n"
-            "Format the output as follows:\n"
-            "### Overall Confidence Score\n"
-            "[Overall Score out of 100]: [Positive summary with encouragement]\n\n"
-            "### Metric-by-Metric Analysis\n"
-            "1. **Volume**: [Score out of 10] - [Friendly analysis with tips]\n"
-            "2. **Rate of Speech (WPM)**: [Score out of 10] - [Friendly analysis with tips]\n"
-            "3. **Pauses**: [Score out of 10] - [Friendly analysis with tips]\n"
-            "4. **Clarity**: [Score out of 10] - [Friendly analysis with tips]\n"
-            "5. **Pitch**: [Score out of 10] - [Friendly analysis with tips]\n"
-            "6. **Intonation**: [Score out of 10] - [Friendly analysis with tips]\n"
         )
     )
+
     formatted_prompt = summary_prompt.format(transcript=transcript, metrics=metrics)
-    response = llm.chat.complete(
-        model="mistral-large-latest",
-        messages=[
-            {"role": "user", "content": formatted_prompt}
-        ]
-    )
-    feedback = response.choices[0].message.content
-   
-    return jsonify({
-        "transcript": transcript,
-        "metrics": metrics,
-        "feedback": feedback
-    })
+
+    def call_mistral():
+        return llm.chat.complete(
+            model="mistral-large-latest",
+            messages=[{"role": "user", "content": formatted_prompt}]
+        )
+
+    # Threaded timeout wrapper
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(call_mistral)
+            response = future.result(timeout=30)  # Timeout in seconds
+
+        feedback = response.choices[0].message.content
+
+        return jsonify({
+            "transcript": transcript,
+            "metrics": metrics,
+            "feedback": feedback
+        })
+
+    except concurrent.futures.TimeoutError:
+        return jsonify({
+            "error": "Mistral API call timed out after 30 seconds. Please try again later."
+        }), 504
+
+    except Exception as e:
+        return jsonify({
+            "error": f"An unexpected error occurred: {str(e)}"
+        }), 500
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)
